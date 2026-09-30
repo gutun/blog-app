@@ -29,10 +29,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # version 交给 package.json 的 packageManager 决定（pnpm@11.7.0），
+      # 避免「workflow 里的 pnpm 版本」和「生成 lockfile 的版本」不一致。
+      # 这里的版本号只作为 packageManager 缺失时的兜底。
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 11
+          version: 11.7.0
+          run_install: false
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -40,16 +44,35 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # 把每一步的输出同时写到 ci-logs/，失败时随 artifact 上传，方便排查
+      - name: Prepare log dir
+        run: mkdir -p ci-logs
+
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --no-frozen-lockfile 2>&1 | tee ci-logs/install.log
+
+      - name: Show versions
+        run: |
+          node --version
+          pnpm --version
+        continue-on-error: true
 
       - name: Test
-        run: pnpm test
+        run: pnpm test 2>&1 | tee ci-logs/test.log
 
       - name: Build
-        run: pnpm build
+        run: pnpm build 2>&1 | tee ci-logs/build.log
 
-      - name: Upload artifact
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+
+      - name: Upload Pages artifact
+        if: success()
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist

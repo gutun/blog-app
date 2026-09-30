@@ -10,10 +10,16 @@
 #   esbuild 的 postinstall 会 spawn 子进程校验/补装平台二进制。在受限环境下该脚本
 #   无法启动子进程并会中断整个 install；平台包里的 esbuild.exe 本身已经可用，
 #   所以显式忽略该脚本。
+#
+# verifyDepsBeforeRun: false
+#   pnpm 11 会在执行 package.json 里的 script 之前做一次依赖状态校验；一旦判定不一致，
+#   它会自己再跑一次 `pnpm install`，在非交互环境（CI）里会直接以退出码 1 失败：
+#     "Command failed ... pnpm install" / confirmModulesPurge
+#   这条校验对本地开发没有实际收益，却会让 CI 上的 `pnpm test` / `pnpm build` 挂掉，
+#   因此显式关闭。
 nodeLinker: hoisted
+
+verifyDepsBeforeRun: false
 
 ignoredBuiltDependencies:
   - esbuild
-
-allowBuilds:
-  esbuild: set this to true or false
