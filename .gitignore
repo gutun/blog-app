@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-ssr
+dev-dist
+.test-build
+.esbuild-tmp
+.eslintcache
+*.local
+.DS_Store
+.vite
+node_modules/.tmp

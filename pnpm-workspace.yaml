@@ -1,0 +1,19 @@
+# pnpm 11 的配置位置（package.json 里的 pnpm 字段已不再被读取）
+#
+# nodeLinker: hoisted
+#   pnpm 默认用符号链接/junction 组织 node_modules。在 Windows + Node 24 上，
+#   `node_modules/vite` 这类 junction 会让 ESM 的裸模块解析失败
+#   （ERR_MODULE_NOT_FOUND: Cannot find package 'rollup'），vite build 直接跑不起来。
+#   改成 hoisted（与 npm 相同的扁平结构）即可正常工作，代价是 node_modules 稍大。
+#
+# ignoredBuiltDependencies: esbuild
+#   esbuild 的 postinstall 会 spawn 子进程校验/补装平台二进制。在受限环境下该脚本
+#   无法启动子进程并会中断整个 install；平台包里的 esbuild.exe 本身已经可用，
+#   所以显式忽略该脚本。
+nodeLinker: hoisted
+
+ignoredBuiltDependencies:
+  - esbuild
+
+allowBuilds:
+  esbuild: set this to true or false

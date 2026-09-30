@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": false,
+    "outDir": ".test-build",
+    "rootDir": "./src",
+    "types": []
+  },
+  "include": ["src/lib/frontmatter.ts", "src/lib/markdown.ts", "src/types.ts"]
+}
