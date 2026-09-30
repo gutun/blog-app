@@ -92,9 +92,23 @@ async function main() {
   await cdp.send('Page.enable')
   await cdp.send('Runtime.enable')
 
+  // 尽早装错误捕获：有些问题发生在首屏渲染之前，事后再查就看不到了
+  await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `
+      window.__errs = [];
+      window.addEventListener('error', (e) => {
+        window.__errs.push('error: ' + (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
+      });
+      window.addEventListener('unhandledrejection', (e) => {
+        window.__errs.push('rejection: ' + ((e.reason && (e.reason.stack || e.reason.message)) || String(e.reason)));
+      });
+    `,
+  })
+
   // 等页面进入可操作状态（默认等 .screen 出现；mock 场景可改成等 __mockGithub）
+  // 线上首屏要下载 1MB+ 的 JS，首次访问还可能没有 CDN 缓存，所以给足 90 秒
   let ready = false
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 300; i++) {
     try {
       const r = await cdp.send('Runtime.evaluate', {
         expression: waitFor,
@@ -109,7 +123,7 @@ async function main() {
     }
     await sleep(300)
   }
-  if (!ready) console.log(`提示：等待条件「${waitFor}」超时，仍继续执行`)
+  if (!ready) console.log(`提示：等待条件「${waitFor}」超时（90 秒），仍继续执行`)
 
   const report = []
   const evalIn = async (expression) => {
@@ -130,6 +144,17 @@ async function main() {
   }
 
   report.push(['顶部横幅', await evalIn('document.querySelector(".update-bar") ? "有新版本可用(不应该出现)" : "无更新提示(正确)"')])
+
+  if (process.env.CDP_DIAG === '1') {
+    report.push(['页面错误', await evalIn('JSON.stringify(window.__errs ?? [])')])
+    report.push(['#root 内容', await evalIn('(document.querySelector("#root")?.innerHTML ?? "").slice(0, 200) || "(空)"')])
+    report.push([
+      '脚本/样式加载',
+      await evalIn(
+        'Array.from(document.querySelectorAll("script[src],link[rel=stylesheet]")).map(e=>e.src||e.href).join(" , ")',
+      ),
+    ])
+  }
 
   if (steps) {
     for (const [label, expression, waitMs] of steps) {
