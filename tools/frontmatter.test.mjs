@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -18,8 +18,67 @@ import { parsePost, serializePost, countWords } from '../.test-build/lib/frontma
 
 const here = dirname(fileURLToPath(import.meta.url))
 const appRoot = join(here, '..')
-const repoPosts = join(appRoot, '..', 'gutun.github.io', 'content', 'posts')
-const archetype = join(appRoot, '..', 'gutun.github.io', 'archetypes', 'posts.md')
+
+/**
+ * 隔壁的真实博客仓库是「可选」的。
+ * CI（GitHub Actions）上只 checkout 了 App 自己这一个仓库，`../gutun.github.io`
+ * 并不存在，所以「拿真实文章做回归」的用例必须能优雅跳过，而不是把构建搞挂。
+ * 字段顺序这类核心断言则用内置 fixture，保证在任何环境都能跑到。
+ */
+const blogRepo = join(appRoot, '..', 'gutun.github.io')
+const blogPosts = join(blogRepo, 'content', 'posts')
+
+function blogRepoMissing() {
+  return existsSync(join(blogRepo, 'archetypes', 'posts.md'))
+    ? false
+    : '未找到同级 gutun.github.io 仓库，跳过真实文章回归'
+}
+
+function realPosts() {
+  if (!existsSync(blogPosts) || !statSync(blogPosts).isDirectory()) return []
+  return readdirSync(blogPosts).filter((f) => f.endsWith('.md'))
+}
+
+/** 与 gutun.github.io/archetypes/posts.md 逐字一致的副本，供 CI 使用 */
+const ARCHE_FIXTURE = `---
+title: {{ replace .TranslationBaseName "-" " " | title }}
+subtitle:
+date: {{ .Date }}
+slug: {{ substr .File.UniqueID 0 7 }}
+draft: false
+author:
+  name: GUTUN
+  link:
+  email:
+  avatar:
+description:
+keywords:
+license:
+comment: false
+weight: 0
+tags:
+  - draft
+categories:
+  - draft
+hiddenFromHomePage: false
+hiddenFromSearch: false
+hiddenFromRelated: false
+hiddenFromFeed: false
+summary:
+toc: true
+math: false
+lightgallery: false
+password:
+message:
+repost:
+  enable: true
+  url:
+
+# See details front matter: https://fixit.lruihao.cn/documentation/content-management/introduction/#front-matter
+---
+
+<!--more-->
+`
 
 const ARCHE_KEYS = [
   'title',
@@ -61,16 +120,19 @@ function frontMatterOf(text) {
   return match[1]
 }
 
-test('序列化结果与 archetypes/posts.md 的字段顺序一致', () => {
-  const arche = readFileSync(archetype, 'utf8')
-  const doc = parsePost(arche)
-  const keys = topLevelKeys(frontMatterOf(serializePost(doc)))
+test('序列化结果与 archetypes/posts.md 的字段顺序一致（内置 fixture）', () => {
+  const keys = topLevelKeys(frontMatterOf(serializePost(parsePost(ARCHE_FIXTURE))))
+  assert.deepEqual(keys, ARCHE_KEYS)
+})
+
+test('若存在真实 archetypes/posts.md，其字段顺序也必须一致', { skip: blogRepoMissing() }, () => {
+  const arche = readFileSync(join(blogRepo, 'archetypes', 'posts.md'), 'utf8')
+  const keys = topLevelKeys(frontMatterOf(serializePost(parsePost(arche))))
   assert.deepEqual(keys, ARCHE_KEYS)
 })
 
 test('archetype 往返后关键字段保持不变', () => {
-  const arche = readFileSync(archetype, 'utf8')
-  const once = serializePost(parsePost(arche))
+  const once = serializePost(parsePost(ARCHE_FIXTURE))
   const twice = serializePost(parsePost(once))
   assert.equal(once, twice, '序列化应当是幂等的')
   const doc = parsePost(once)
@@ -82,12 +144,12 @@ test('archetype 往返后关键字段保持不变', () => {
   assert.deepEqual(doc.frontMatter.tags, ['draft'])
 })
 
-test('仓库中所有已发布文章都能被解析且往返稳定', () => {
-  const files = readdirSync(repoPosts).filter((f) => f.endsWith('.md'))
+test('仓库中所有已发布文章都能被解析且往返稳定', { skip: blogRepoMissing() }, () => {
+  const files = realPosts()
   assert.ok(files.length > 100, `应当能读到仓库文章，实际 ${files.length} 篇`)
   let checked = 0
   for (const file of files) {
-    const raw = readFileSync(join(repoPosts, file), 'utf8')
+    const raw = readFileSync(join(blogPosts, file), 'utf8')
     const doc = parsePost(raw)
     assert.ok(doc.frontMatter.title.length > 0, `${file} 应当解析出标题`)
     assert.ok(doc.frontMatter.slug.length > 0, `${file} 应当有 slug`)
@@ -102,12 +164,25 @@ test('仓库中所有已发布文章都能被解析且往返稳定', () => {
 })
 
 test('正文中的 <!--more--> 与正文内容原样保留', () => {
-  const raw = readFileSync(join(repoPosts, 'diary20260927.md'), 'utf8')
+  const raw = `---
+title: 日记 - 在千岛湖
+date: 2026-09-27T21:00:34+08:00
+slug: 5f91ad5
+categories:
+  - 日记
+tags:
+  - 日记
+---
+
+<!--more-->
+
+我不打算写太多，感觉没有必要事无巨细的记录。
+`
   const doc = parsePost(raw)
-  assert.ok(doc.body.includes('<!--more-->'))
+  assert.ok(doc.body.includes('<!--more-->'), '解析后正文应含 more 分隔符')
   const out = serializePost(doc)
-  assert.ok(out.includes('<!--more-->'))
-  assert.ok(out.includes('千岛湖') === false || true)
+  assert.ok(out.includes('<!--more-->'), '序列化后应保留 more 分隔符')
+  assert.ok(out.includes('我不打算写太多'), '正文内容不应丢失')
 })
 
 test('标题里的冒号、引号、井号不会破坏 YAML', () => {
