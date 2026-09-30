@@ -7,8 +7,8 @@ import { EditorScreen } from './screens/EditorScreen'
 import { SettingsScreen } from './screens/SettingsScreen'
 import { loadDraft } from './lib/drafts'
 import type { Draft } from './lib/drafts'
+import { useServiceWorker } from './lib/use-service-worker'
 import type { PostSummary } from './types'
-import { useRegisterSW } from 'virtual:pwa-register/react'
 
 export type Route =
   | { kind: 'list' }
@@ -79,7 +79,7 @@ function Shell() {
   const [pendingDraft, setPendingDraft] = useState<Draft | null>(null)
   const [editorKey, setEditorKey] = useState(0)
 
-  const { needRefresh, updateServiceWorker } = useRegisterSW({ immediate: true })
+  const sw = useServiceWorker()
 
   // 直接以 #/edit/draft:xxx 打开（例如刷新页面）时，从 IndexedDB 恢复
   useEffect(() => {
@@ -119,11 +119,18 @@ function Shell() {
     <div className="app">
       {!online && <div className="offline-bar">离线模式：编辑会保存到本机，联网后再发布</div>}
 
-      {needRefresh && (
+      {sw.updateReady && (
         <div className="update-bar">
           <span>有新版本可用</span>
-          <button type="button" className="btn small primary" onClick={() => void updateServiceWorker(true)}>
+          <button
+            type="button"
+            className="btn small primary"
+            onClick={() => sw.applyUpdate()}
+          >
             立即更新
+          </button>
+          <button type="button" className="link-btn" onClick={() => sw.snooze()}>
+            稍后
           </button>
         </div>
       )}

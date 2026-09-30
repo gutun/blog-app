@@ -20,6 +20,10 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'prompt',
+      // 注册由 src/lib/use-service-worker.ts 自己接管：插件的 useRegisterSW 在
+      // 「首次安装 / 已有 worker 等待」这些边界上会误报「有新版本可用」，
+      // 而且自动注入的注册代码会与我们的逻辑重复注册。
+      injectRegister: null,
       includeAssets: ['favicon.svg', 'apple-touch-icon.png'],
       manifest: {
         name: 'GUTUN 博客写作',

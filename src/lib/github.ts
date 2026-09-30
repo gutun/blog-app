@@ -125,31 +125,170 @@ export async function resolveDefaultBranch(settings: Settings): Promise<string> 
 /** 列出 content/posts 下的所有 md 文件（1 次 API 调用） */
 export async function listPostFiles(settings: Settings): Promise<PostSummary[]> {
   const branch = await resolveDefaultBranch(settings)
-  const dir = settings.postsDir.replace(/^\/+|\/+$/g, '')
+  const dir = postsDirOf(settings)
   const data = await ghFetch<{ tree: TreeEntry[]; truncated: boolean }>(
     settings,
     `${repoPath(settings)}/git/trees/${encodeURIComponent(branch)}?recursive=1`,
   )
-  const posts = data.tree
-    .filter(
-      (e) =>
-        e.type === 'blob' &&
-        e.path.startsWith(`${dir}/`) &&
-        /\.(md|markdown)$/i.test(e.path) &&
-        !e.path.slice(dir.length + 1).includes('/'),
-    )
-    .map<PostSummary>((e) => {
-      cache.shas.set(e.path, e.sha)
-      return {
-        path: e.path,
-        name: e.path.slice(dir.length + 1),
-        sha: e.sha,
-        title: '',
-        date: '',
-        loaded: false,
-      }
-    })
-  return posts
+  return data.tree.filter(isPostEntry(dir)).map<PostSummary>((e) => {
+    cache.shas.set(e.path, e.sha)
+    return {
+      path: e.path,
+      name: e.path.slice(dir.length + 1),
+      sha: e.sha,
+      title: '',
+      date: '',
+      loaded: false,
+    }
+  })
+}
+
+/* ------------------------------------------------------- 增量刷新用的原语 */
+
+export interface TreeSnapshot {
+  branch: string
+  /** 分支当前指向的 commit */
+  commitSha: string
+  /** 该 commit 的 tree sha（整棵树的内容指纹） */
+  treeSha: string
+}
+
+/** 取「当前 tree 指纹」。用于判断自上次缓存以来仓库有没有变化。 */
+export async function fetchTreeSnapshot(settings: Settings): Promise<TreeSnapshot> {
+  const branch = await resolveDefaultBranch(settings)
+  const head = await ghFetch<{ commit: { sha: string; commit: { tree: { sha: string } } } }>(
+    settings,
+    `${repoPath(settings)}/commits/${encodeURIComponent(branch)}`,
+  )
+  return { branch, commitSha: head.commit.sha, treeSha: head.commit.commit.tree.sha }
+}
+
+/**
+ * 顺着提交历史往前找，找到 tree sha 等于 `targetTreeSha` 的那次提交，
+ * 也就是缓存建立时的那个时间点。
+ */
+async function findCommitWithTree(
+  settings: Settings,
+  startCommitSha: string,
+  targetTreeSha: string,
+  maxDepth = 25,
+): Promise<string | null> {
+  let sha = startCommitSha
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const commit = await ghFetch<{
+      sha: string
+      commit: { tree: { sha: string } }
+      parents: { sha: string }[]
+    }>(settings, `${repoPath(settings)}/commits/${sha}`)
+
+    if (commit.commit.tree.sha === targetTreeSha) return commit.sha
+    const parent = commit.parents?.[0]
+    if (!parent) return null
+    sha = parent.sha
+  }
+  return null
+}
+
+export interface IncrementalScan {
+  treeSha: string
+  branch: string
+  /** postsDir 下需要重新解析的文件（新增或改动） */
+  changed: { path: string; blobSha: string }[]
+  /** postsDir 下被删除的文件 */
+  removed: string[]
+  /** 当前所有文章文件（含未变动的），用于校正列表 */
+  files: { path: string; blobSha: string }[]
+}
+
+/**
+ * 判断能否增量：不行就返回 null，让调用方走「全量」。
+ *
+ * `trees/{base}...{head}` 返回两个 tree 的差异，只需要重新解析 changed 里的文件，
+ * 而不是把 160 多篇全部重读一遍。
+ */
+export async function scanIncrementally(
+  settings: Settings,
+  cachedTreeSha: string,
+): Promise<IncrementalScan | null> {
+  const dir = postsDirOf(settings)
+  const snapshot = await fetchTreeSnapshot(settings)
+  if (snapshot.treeSha === cachedTreeSha) {
+    // 完全没有变化：changed/removed 都是空的，调用方据此直接复用缓存。
+    // files 也返回空数组 —— 拿到结果后请先判断 changed/removed 是否为空，
+    // 不要用 files 去重建列表（那会把列表清空）。
+    return { treeSha: snapshot.treeSha, branch: snapshot.branch, changed: [], removed: [], files: [] }
+  }
+
+  const baseCommit = await findCommitWithTree(settings, snapshot.commitSha, cachedTreeSha)
+  if (!baseCommit) return null
+
+  const diff = await ghFetch<{
+    files?: { filename: string; status: string; sha?: string; previous_filename?: string }[]
+  }>(settings, `${repoPath(settings)}/compare/${baseCommit}...${snapshot.commitSha}`)
+
+  const files = diff.files ?? []
+  // GitHub 的 compare 单次最多返回 300 个文件；拿到上限说明结果被截断，
+  // 这时增量会漏掉文件，直接退回全量更安全。
+  if (files.length >= 300) return null
+
+  const changed: { path: string; blobSha: string }[] = []
+  const removed: string[] = []
+  for (const file of files) {
+    const isPost =
+      file.filename.startsWith(`${dir}/`) &&
+      /\.(md|markdown)$/i.test(file.filename) &&
+      !file.filename.slice(dir.length + 1).includes('/')
+    if (file.status === 'removed') {
+      if (isPost) removed.push(file.filename)
+      continue
+    }
+    if (!isPost) continue
+    if (file.status === 'renamed' || file.status === 'added' || file.status === 'modified') {
+      changed.push({ path: file.filename, blobSha: file.sha ?? '' })
+      if (file.status === 'renamed' && file.previous_filename) removed.push(file.previous_filename)
+    }
+  }
+
+  // 取一份完整清单，用来校正「缓存里有但仓库里已经没了」的条目
+  const tree = await ghFetch<{ tree: TreeEntry[] }>(
+    settings,
+    `${repoPath(settings)}/git/trees/${encodeURIComponent(snapshot.treeSha)}?recursive=1`,
+  )
+  const all = tree.tree.filter(isPostEntry(dir)).map((e) => ({ path: e.path, blobSha: e.sha }))
+  for (const entry of all) cache.shas.set(entry.path, entry.blobSha)
+
+  return { treeSha: snapshot.treeSha, branch: snapshot.branch, changed, removed, files: all }
+}
+
+/** 全量扫描：列出当前所有文章文件（含 blob sha） */
+export async function scanFully(settings: Settings): Promise<IncrementalScan> {
+  const dir = postsDirOf(settings)
+  const snapshot = await fetchTreeSnapshot(settings)
+  const tree = await ghFetch<{ tree: TreeEntry[] }>(
+    settings,
+    `${repoPath(settings)}/git/trees/${encodeURIComponent(snapshot.treeSha)}?recursive=1`,
+  )
+  const files = tree.tree.filter(isPostEntry(dir)).map((e) => ({ path: e.path, blobSha: e.sha }))
+  for (const entry of files) cache.shas.set(entry.path, entry.blobSha)
+  return {
+    treeSha: snapshot.treeSha,
+    branch: snapshot.branch,
+    changed: files,
+    removed: [],
+    files,
+  }
+}
+
+function postsDirOf(settings: Settings): string {
+  return settings.postsDir.replace(/^\/+|\/+$/g, '')
+}
+
+function isPostEntry(dir: string) {
+  return (e: TreeEntry): boolean =>
+    e.type === 'blob' &&
+    e.path.startsWith(`${dir}/`) &&
+    /\.(md|markdown)$/i.test(e.path) &&
+    !e.path.slice(dir.length + 1).includes('/')
 }
 
 function decodeContent(payload: { content?: string; encoding?: string }): string {
@@ -158,60 +297,84 @@ function decodeContent(payload: { content?: string; encoding?: string }): string
   return base64DecodeUtf8(payload.content)
 }
 
-/**
- * 读取单个文件。
- * 公开仓库优先走 raw.githubusercontent.com —— 它不消耗 GitHub API 的
- * 5000 次/小时配额，列表页因此可以放心地逐篇读取 front matter。
- * 私有仓库（或 raw 取不到时）再回退到 Contents API。
- */
-export async function readFile(settings: Settings, path: string): Promise<PostFile> {
-  const branch = await resolveDefaultBranch(settings)
-  const name = path.split('/').pop() ?? path
-
-  // 私有仓库不能用 raw，先确认一次（结果会缓存）
-  if (cache.isPrivate === undefined) {
-    try {
-      await fetchRepo(settings)
-    } catch {
-      // 探测失败就当公开仓库试一次 raw，失败会自动回退到 API
-    }
+/** 确保仓库公开/私有已知，决定能不能走 raw */
+async function ensureRepoVisibility(settings: Settings): Promise<void> {
+  if (cache.isPrivate !== undefined) return
+  try {
+    await fetchRepo(settings)
+  } catch {
+    // 探测失败就当公开仓库试一次 raw，失败会自动回退到 API
   }
+}
 
+/** 正文读取：公开仓库走 raw（不吃 API 配额），否则走 Contents API */
+async function fetchContent(settings: Settings, path: string, branch: string): Promise<string> {
+  await ensureRepoVisibility(settings)
   if (!cache.isPrivate) {
     try {
       const rawUrl = `https://raw.githubusercontent.com/${settings.owner}/${settings.repo}/${encodeURIComponent(
         branch,
       )}/${path.split('/').map(encodeURIComponent).join('/')}`
       const res = await fetch(rawUrl, { cache: 'no-cache' })
-      if (res.ok) {
-        return {
-          path,
-          name,
-          sha: cache.shas.get(path) ?? '',
-          title: '',
-          date: '',
-          loaded: false,
-          content: await res.text(),
-        }
-      }
+      if (res.ok) return await res.text()
     } catch {
-      // 网络异常时走下面的 API 分支
+      // 网络异常时回退到 API
     }
   }
-
-  const data = await ghFetch<{ content?: string; encoding?: string; sha: string; path: string }>(
+  const data = await ghFetch<{ content?: string; encoding?: string; sha: string }>(
     settings,
     `${repoPath(settings)}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`,
   )
   cache.shas.set(path, data.sha)
+  return decodeContent(data)
+}
+
+/**
+ * 批量读取文件内容（带并发上限）。
+ * 增量刷新时只需要读「变了的那些」，通常只有 0～几个文件。
+ */
+export async function readFileContents(
+  settings: Settings,
+  paths: string[],
+  concurrency = 6,
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>()
+  if (paths.length === 0) return result
+  const branch = await resolveDefaultBranch(settings)
+  let cursor = 0
+  const worker = async () => {
+    while (cursor < paths.length) {
+      const path = paths[cursor++]
+      try {
+        result.set(path, await fetchContent(settings, path, branch))
+      } catch {
+        // 单个文件读失败不阻塞其它文件
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, paths.length) }, () => worker()),
+  )
+  return result
+}
+
+/**
+ * 读取单个文件。
+ * 公开仓库优先走 raw.githubusercontent.com —— 它不消耗 GitHub API 的
+ * 5000 次/小时配额；私有仓库（或 raw 取不到时）再回退到 Contents API。
+ */
+export async function readFile(settings: Settings, path: string): Promise<PostFile> {
+  const branch = await resolveDefaultBranch(settings)
+  const name = path.split('/').pop() ?? path
+  const content = await fetchContent(settings, path, branch)
   return {
     path,
     name,
-    sha: data.sha,
+    sha: cache.shas.get(path) ?? '',
     title: '',
     date: '',
     loaded: false,
-    content: decodeContent(data),
+    content,
   }
 }
 

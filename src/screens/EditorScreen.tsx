@@ -3,6 +3,7 @@ import type { EditorView } from '@codemirror/view'
 import { MarkdownEditor } from '../components/MarkdownEditor'
 import { WriteToolbar } from '../components/WriteToolbar'
 import { ChipInput } from '../components/ChipInput'
+import { ActionSheet } from '../components/ActionSheet'
 import { useStore } from '../lib/store-context'
 import {
   countWords,
@@ -18,7 +19,14 @@ import {
   writeTextFile,
   GitHubError,
 } from '../lib/github'
-import { deleteDraft, newDraftId, saveDraft } from '../lib/drafts'
+import {
+  deleteDraft,
+  deleteRecovery,
+  loadRecovery,
+  newDraftId,
+  saveDraft,
+  saveRecovery,
+} from '../lib/drafts'
 import type { Draft } from '../lib/drafts'
 import { ensureKatexStyles, renderMarkdown } from '../lib/markdown'
 import { prepareImage, formatBytes, timestampName } from '../lib/image'
@@ -100,7 +108,9 @@ export function EditorScreen({ initial, initialDraft, demo = false, onExit, onPu
   const [uploading, setUploading] = useState(false)
   const [draftId] = useState(() => initialDraft?.id ?? newDraftId())
   const [published, setPublished] = useState<PublishInfo | null>(null)
-  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null)
+  const [snapshotAt, setSnapshotAt] = useState<number | null>(null)
+  const [askSave, setAskSave] = useState(false)
+  const [restoredNotice, setRestoredNotice] = useState(false)
 
   const viewRef = useRef<EditorView | null>(null)
   const initialRef = useRef({ fm: frontMatter, body })
@@ -148,7 +158,7 @@ export function EditorScreen({ initial, initialDraft, demo = false, onExit, onPu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initial?.path])
 
-  /* ---------------------------------------------------------- 草稿自动保存 */
+  /* ------------------------------------ 未落盘内容的恢复快照 + 修改判定 */
 
   const dirty = useMemo(
     () =>
@@ -157,41 +167,60 @@ export function EditorScreen({ initial, initialDraft, demo = false, onExit, onPu
     [frontMatter, body],
   )
 
+  /** 攒一份「编辑中」的快照，防止 App 被系统杀掉丢内容。
+   *  注意：它不会出现在草稿列表里，只有用户选择保存时才提升为正式草稿。 */
+  const snapshot = useMemo<Draft>(
+    () => ({
+      id: draftId,
+      title: frontMatter.title,
+      path: `${settings.postsDir.replace(/\/+$/, '')}/${fileName}.md`,
+      sha,
+      frontMatter,
+      body,
+      createdAt: initialDraft?.createdAt ?? Date.now(),
+      updatedAt: Date.now(),
+      existing: isExisting,
+    }),
+    [body, draftId, fileName, frontMatter, initialDraft?.createdAt, isExisting, settings.postsDir, sha],
+  )
+  const snapshotRef = useRef(snapshot)
+  snapshotRef.current = snapshot
+
+  // 打开一篇没写完的文章（或新建时上次写到一半）时，把快照恢复回来
   useEffect(() => {
-    if (demo) return
-    if (loading || published) return
-    if (!dirty) return
+    if (demo || initialDraft) return
+    let cancelled = false
+    void (async () => {
+      const recovered = await loadRecovery(draftId)
+      if (cancelled || !recovered) return
+      // 只有确实和当前内容不同才覆盖，避免把刚读到的仓库内容顶掉
+      const sameAsRepo =
+        JSON.stringify(recovered.frontMatter) === JSON.stringify(initialRef.current.fm) &&
+        recovered.body === initialRef.current.body
+      if (sameAsRepo) return
+      setFrontMatter(recovered.frontMatter)
+      setBody(recovered.body)
+      if (recovered.sha) setSha(recovered.sha)
+      setRestoredNotice(true)
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [demo, draftId, initialDraft])
+
+  useEffect(() => {
+    if (demo || loading || published) return
+    if (!dirty) {
+      // 没有修改就不该留下任何快照
+      void deleteRecovery(draftId)
+      return
+    }
     const timer = window.setTimeout(() => {
-      const draft: Draft = {
-        id: draftId,
-        title: frontMatter.title,
-        path: `${settings.postsDir.replace(/\/+$/, '')}/${fileName}.md`,
-        sha,
-        frontMatter,
-        body,
-        createdAt: initialDraft?.createdAt ?? Date.now(),
-        updatedAt: Date.now(),
-        existing: isExisting,
-      }
-      void saveDraft(draft)
-        .then(() => setLastSavedAt(Date.now()))
-        .catch(() => undefined)
-    }, 1200)
+      void saveRecovery(snapshotRef.current).then(() => setSnapshotAt(Date.now()))
+    }, 1500)
     return () => window.clearTimeout(timer)
-  }, [
-    body,
-    demo,
-    dirty,
-    draftId,
-    fileName,
-    frontMatter,
-    initialDraft?.createdAt,
-    isExisting,
-    loading,
-    published,
-    settings.postsDir,
-    sha,
-  ])
+  }, [body, demo, dirty, draftId, frontMatter, loading, published])
 
   /* ------------------------------------------------------------------ 预览 */
 
@@ -317,14 +346,41 @@ export function EditorScreen({ initial, initialDraft, demo = false, onExit, onPu
 
   const wordCount = useMemo(() => countWords(body), [body])
 
+  /**
+   * 退出行为：
+   *   - 没改动过 → 直接走，不产生任何草稿
+   *   - 改动过   → 弹面板问一次「保存草稿 / 不保存 / 继续编辑」
+   *     选保存 → 提升为正式草稿（列表页能看到）；选不保存 → 连恢复快照一起清掉
+   */
   const exit = useCallback(() => {
-    if (published) {
+    if (published || demo) {
       onExit()
       return
     }
-    if (dirty && !window.confirm('草稿已自动保存在本机。确定要离开编辑页吗？')) return
-    onExit()
-  }, [dirty, onExit, published])
+    if (!dirty) {
+      void deleteRecovery(draftId)
+      onExit()
+      return
+    }
+    setAskSave(true)
+  }, [demo, dirty, draftId, onExit, published])
+
+  const saveDraftAndExit = useCallback(() => {
+    void saveDraft(snapshotRef.current)
+      .then(() => deleteRecovery(draftId))
+      .finally(() => {
+        setAskSave(false)
+        pushToast('success', '已保存到「本机草稿」')
+        onExit()
+      })
+  }, [draftId, onExit, pushToast])
+
+  const discardAndExit = useCallback(() => {
+    void Promise.all([deleteRecovery(draftId), deleteDraft(draftId)]).finally(() => {
+      setAskSave(false)
+      onExit()
+    })
+  }, [draftId, onExit])
 
   /* ------------------------------------------------------------- 发布成功页 */
 
@@ -395,6 +451,22 @@ export function EditorScreen({ initial, initialDraft, demo = false, onExit, onPu
       {demo && (
         <div className="demo-bar">
           这是演示内容，不会提交到 GitHub。点左上角 ← 返回，或到「设置」填好 Token 开始真的写。
+        </div>
+      )}
+
+      {restoredNotice && (
+        <div className="restore-bar">
+          已恢复上次没写完的内容
+          <button
+            type="button"
+            className="link-btn"
+            onClick={() => {
+              void deleteRecovery(draftId)
+              setRestoredNotice(false)
+            }}
+          >
+            知道了
+          </button>
         </div>
       )}
 
@@ -568,7 +640,7 @@ export function EditorScreen({ initial, initialDraft, demo = false, onExit, onPu
               </button>
               <span className="editor-stats">
                 {wordCount} 字 · {body.split('\n').length} 行
-                {lastSavedAt ? ' · 已存本地' : ''}
+                {dirty && snapshotAt ? ' · 未保存' : ''}
               </span>
             </div>
 
@@ -612,6 +684,18 @@ export function EditorScreen({ initial, initialDraft, demo = false, onExit, onPu
             </button>
           </div>
         </>
+      )}
+
+      {askSave && (
+        <ActionSheet
+          title="要保存到本机草稿吗？"
+          description="保存后可以在「我的博客 → 本机草稿」里继续写；选择不保存则本次修改不会留下任何记录。"
+          choices={[
+            { label: '保存草稿并退出', variant: 'primary', onClick: saveDraftAndExit },
+            { label: '不保存，直接退出', variant: 'danger', onClick: discardAndExit },
+            { label: '继续编辑', onClick: () => setAskSave(false) },
+          ]}
+        />
       )}
     </div>
   )

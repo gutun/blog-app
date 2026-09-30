@@ -49,7 +49,8 @@
 | Markdown 编辑 | CodeMirror 6：语法高亮、工具栏插入（标题/粗体/引用/列表/表格/公式/`<!--more-->`） |
 | 实时预览 | `markdown-it` + KaTeX，支持 `$...$`、`$$...$$`、`\(...\)`、`\[...\]`，与站点配置一致 |
 | 图片上传 | 手机选图 → 自动压缩到长边 1600px → 提交到 `static/images/` → 自动插入 Markdown 链接 |
-| 离线草稿 | 内容存 IndexedDB，断网继续写；联网后再发布 |
+| 草稿行为 | **打开不修改就退出 → 什么都不保存**；改过了才弹窗问「保存草稿 / 不保存 / 继续编辑」 |
+| 秒开 + 增量刷新 | 列表元数据缓存在本机（秒开）；刷新时按 git 差异**只重解析改动过的文章** |
 | 分类 / 标签联想 | 从线上站点抓取已有分类标签，点一下就填 |
 | 演示模式 | `#/demo` 用示例内容展示排版与公式，不需要 Token、不会提交 |
 | 深色模式 | 跟随系统 / 手动切换，配色沿用 FixIt 的 `#5bbad5` |
@@ -234,20 +235,47 @@ APP/
 pnpm install        # 安装依赖（本机需 nodeLinker: hoisted，见 pnpm-workspace.yaml 注释）
 pnpm dev            # 本地开发（http://localhost:5173）
 pnpm build          # 类型检查 + 生产构建，产物在 dist/
-pnpm test           # front matter 往返测试 + Markdown/公式渲染测试
+pnpm test           # front matter 往返 + Markdown/公式渲染（联网用例默认跳过）
 pnpm serve          # 局域网静态服务（手机浏览器访问）
 pnpm icons          # 重新生成图标（需要 Python + Pillow）
 ```
 
+联网用例（校验增量刷新依赖的 GitHub 端点，跑在真实仓库上）默认跳过，需要时显式开启：
+
+```bash
+# 未认证的 GitHub API 每小时只有 60 次，设 GITHUB_TOKEN 可提升到 5000，避免被限流
+BLOG_APP_NET_TESTS=1 GITHUB_TOKEN=ghp_xxx pnpm test
+```
+
+界面交互的自动化检查（用 CDP 驱动无头 Chrome，可验证弹窗这类交互）：
+
+```bash
+node tools/cdp-check.mjs "http://localhost:4180/#/new" shot.png ".topbar .icon-btn"
+```
+
 ### 技术选型
 
-React 19 + TypeScript + Vite 7 + `vite-plugin-pwa`。
+React 19 + TypeScript + Vite 7 + `vite-plugin-pwa`（Service Worker 注册自行实现）。
 Markdown 用 `markdown-it`，公式用 KaTeX，编辑器用 CodeMirror 6，
 没有任何后端服务、没有第三方统计、没有云函数。
 
+### 列表页为什么快
+
+```
+打开 App → 读 IndexedDB 缓存 → 立刻渲染（不等网络）
+        → 后台取分支当前 tree sha（1 次请求）
+           ├─ 与缓存一致        → 结束，0 次解析
+           └─ 不一致 → 顺提交历史找到缓存那棵树
+                     → compare 拿到「改动的文件」
+                     → 只重新读取并解析这些文件 → 更新缓存
+```
+
+每条缓存都带 git blob sha，所以只有「文件真的变了」才重新解析；
+读取失败的文件会在下次刷新时自动重试，不需要手动清缓存。
+
 ### 测试覆盖了什么
 
-`pnpm test` 里有 24 个用例，其中比较关键的几条：
+`pnpm test` 里有 30 个用例，其中比较关键的几条：
 
 - 把 `archetypes/posts.md` 和仓库里**全部 160 多篇文章**解析后再序列化，
   结果必须幂等、字段顺序必须与 archetype 一致（防止用 App 改一次就悄悄丢掉字段）
@@ -255,6 +283,8 @@ Markdown 用 `markdown-it`，公式用 KaTeX，编辑器用 CodeMirror 6，
 - CRLF / BOM / 缺 front matter / YAML 日期对象 等边界
 - 公式里的 `_`、`*` 不被 Markdown 强调语法吃掉；`$a$ 与 $b$` 这种误配不会被当成公式
 - 页面上不存在的字段（例如 `collections`）原样保留
+- （联网，需显式开启）增量刷新用的 `commits` / `trees` / `compare` 端点在真实仓库上可用，
+  且 compare 返回的 sha 与 tree 里的 blob sha 一致
 
 ---
 
@@ -263,8 +293,13 @@ Markdown 用 `markdown-it`，公式用 KaTeX，编辑器用 CodeMirror 6，
 - **iOS 必须用 Safari 安装**，而且 iOS 对 PWA 的后台限制较严，编辑长文时不要切太久后台。
 - 图片直接提交进仓库（`static/images/`），会让仓库体积增长；App 已压缩到长边 1600px，
   但如果大量发图，建议改用图床再手工贴链接。
-- 列表页首次加载会逐篇读取 front matter（默认 6 并发）；公开仓库走
-  `raw.githubusercontent.com`，不吃 GitHub API 配额。列表有 2 分钟缓存。
+- 列表页**首次**打开（还没有缓存）需要逐篇读取 front matter（默认 6 并发）；
+  之后打开都走本地缓存秒开，只有改动过的文章会被重新读取。公开仓库走
+  `raw.githubusercontent.com`，不吃 GitHub API 配额。
+- 提交不会被「未修改」触发：打开一篇文章什么都不改就退出，仓库和本机都不会留下任何东西。
+  编辑过程中会留一份**恢复快照**（IndexedDB，不出现在草稿列表里），
+  万一 App 被系统杀掉，下次打开会自动恢复并提示。
+- 增量刷新最多回溯 25 次提交；如果相隔太久（例如几个月没打开），会自动退回全量读取。
 - 没有「删除文章」功能：删文章请仍在 VSCode / GitHub 上做，避免手机上误删。
 - 手机上不显示 `MathJax` 相关扩展；KaTeX 字体走 jsDelivr CDN，首次预览公式需要联网
   （之后会被 Service Worker 缓存）。

@@ -4,6 +4,7 @@ import { DEFAULT_SETTINGS } from '../types'
 import type { Settings } from '../types'
 import { actionsUrl, fetchRepo, invalidateCache, verifyToken } from '../lib/github'
 import { listDrafts } from '../lib/drafts'
+import { clearPostCache } from '../lib/post-cache'
 
 interface Props {
   onBack: () => void
@@ -220,6 +221,25 @@ export function SettingsScreen({ onBack }: Props) {
             </button>
           ))}
         </div>
+      </section>
+
+      <section className="card">
+        <h2>文章列表缓存</h2>
+        <p className="muted small">
+          标题 / 日期 / 分类会缓存在本机，打开 App 时先用缓存秒开，再在后台按 git
+          的变化增量刷新 —— 只重新解析改动过的文章，没变的直接复用。
+        </p>
+        <button
+          type="button"
+          className="btn full"
+          onClick={() => {
+            void clearPostCache().then(() =>
+              pushToast('info', '缓存已清除，下次进入列表会全量读取一次'),
+            )
+          }}
+        >
+          清除文章列表缓存
+        </button>
       </section>
 
       <section className="card">
