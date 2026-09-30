@@ -15,5 +15,11 @@
     "rootDir": "./src",
     "types": []
   },
-  "include": ["src/lib/frontmatter.ts", "src/lib/markdown.ts", "src/types.ts"]
+  "include": [
+    "src/lib/frontmatter.ts",
+    "src/lib/markdown.ts",
+    "src/lib/github.ts",
+    "src/lib/post-cache.ts",
+    "src/types.ts"
+  ]
 }

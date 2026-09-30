@@ -1,10 +1,12 @@
 /**
- * 用 Chrome DevTools 协议驱动无头浏览器做交互验证。
- * 用法：
- *   node tools/cdp-check.mjs <url> <截图路径> [点击的选择器] [点击前执行的JS]
+ * 用 Chrome DevTools 协议驱动无头浏览器做交互与集成验证。
  *
- * 之所以不用 --screenshot 直出：那只能证明「页面渲染了」，
- * 证明不了「点返回按钮会弹出保存草稿询问」这类交互。
+ * 用法：
+ *   node tools/cdp-check.mjs <url> <截图路径> [点击的选择器] [点击前执行的JS] [点击后再点的选择器]
+ *   CDP_STEPS='[["说明","JS表达式",等待毫秒], ...]' node tools/cdp-check.mjs <url> <截图路径>
+ *
+ * CDP_STEPS 用来做多步集成验证（例如：进列表 → 读缓存 → 手动刷新 → 看请求计数），
+ * 每步都是一个在页面里求值的表达式，结果会打印出来。
  */
 import { spawn } from 'node:child_process'
 import { mkdtempSync, writeFileSync } from 'node:fs'
@@ -12,8 +14,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const [, , url, shotPath, selector, preScript, afterSelector] = process.argv
+const steps = process.env.CDP_STEPS ? JSON.parse(process.env.CDP_STEPS) : null
+/** 额外等待条件：页面里这个表达式返回真值后才开始执行步骤（用于等 mock/数据就绪） */
+const waitFor = process.env.CDP_WAIT_FOR ?? 'document.querySelector(".screen") ? true : false'
 const port = 9222 + Math.floor(Math.random() * 500)
-const profile = mkdtempSync(join(tmpdir(), 'cdp-'))
+const profile = process.env.CDP_PROFILE ?? mkdtempSync(join(tmpdir(), 'cdp-'))
 
 const CHROME =
   process.env.CHROME_PATH ?? 'C:/Program Files/Google/Chrome/Application/chrome.exe'
@@ -87,24 +92,52 @@ async function main() {
   await cdp.send('Page.enable')
   await cdp.send('Runtime.enable')
 
-  // 等应用挂载完成
-  for (let i = 0; i < 30; i++) {
-    const r = await cdp.send('Runtime.evaluate', {
-      expression: 'document.querySelector(".screen") ? "ready" : "no"',
-      returnByValue: true,
-    })
-    if (r.result.value === 'ready') break
+  // 等页面进入可操作状态（默认等 .screen 出现；mock 场景可改成等 __mockGithub）
+  let ready = false
+  for (let i = 0; i < 60; i++) {
+    try {
+      const r = await cdp.send('Runtime.evaluate', {
+        expression: waitFor,
+        returnByValue: true,
+      })
+      if (r.result?.value === true) {
+        ready = true
+        break
+      }
+    } catch {
+      // 页面还在加载/切换，继续等
+    }
     await sleep(300)
   }
+  if (!ready) console.log(`提示：等待条件「${waitFor}」超时，仍继续执行`)
 
   const report = []
   const evalIn = async (expression) => {
-    const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true })
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.text)
+    const r = await cdp.send('Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    })
+    if (r.exceptionDetails) {
+      const ex = r.exceptionDetails
+      const detail =
+        ex.exception?.description ??
+        ex.exception?.value ??
+        `${ex.text}${ex.lineNumber !== undefined ? ` @第 ${ex.lineNumber + 1} 行` : ''}`
+      throw new Error(`页面内报错：${detail}`)
+    }
     return r.result.value
   }
 
   report.push(['顶部横幅', await evalIn('document.querySelector(".update-bar") ? "有新版本可用(不应该出现)" : "无更新提示(正确)"')])
+
+  if (steps) {
+    for (const [label, expression, waitMs] of steps) {
+      const value = await evalIn(expression)
+      report.push([label, value])
+      await sleep(waitMs ?? 400)
+    }
+  }
 
   if (preScript) {
     report.push(['执行前置脚本', await evalIn(preScript)])

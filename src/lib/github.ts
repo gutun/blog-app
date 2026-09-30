@@ -5,7 +5,7 @@
  * 这样每次发布对 GitHub 来说就是一次普通提交 —— 与你现在 `git push` 的效果完全相同，
  * GitHub Actions 会自动重新构建 GitHub Pages。
  */
-import { base64DecodeUtf8, base64EncodeUtf8, wrapBase64 } from '../types'
+import { base64DecodeUtf8, base64EncodeUtf8, wrapBase64 } from '../types.ts'
 import type { GitHubUser, PostFile, PostSummary, Settings } from '../types'
 
 const API = 'https://api.github.com'
@@ -153,19 +153,51 @@ export interface TreeSnapshot {
   treeSha: string
 }
 
-/** 取「当前 tree 指纹」。用于判断自上次缓存以来仓库有没有变化。 */
+/**
+ * 取「当前 tree 指纹」。用于判断自上次缓存以来仓库有没有变化。
+ *
+ * 注意字段层级：`GET /commits/{ref}` 返回的是
+ *   { sha: "<commit sha>", commit: { tree: { sha: "<tree sha>" }, ... }, parents: [...] }
+ * 即 `commit` 对象里直接放 `tree`，没有嵌套的第二个 `commit`。
+ * （这里曾经写成 `head.commit.commit.tree.sha`，导致手机上打开就报
+ *   Cannot read properties of undefined (reading 'tree')。）
+ */
 export async function fetchTreeSnapshot(settings: Settings): Promise<TreeSnapshot> {
   const branch = await resolveDefaultBranch(settings)
-  const head = await ghFetch<{ commit: { sha: string; commit: { tree: { sha: string } } } }>(
+  const head = await ghFetch<GitCommitResponse>(
     settings,
     `${repoPath(settings)}/commits/${encodeURIComponent(branch)}`,
   )
-  return { branch, commitSha: head.commit.sha, treeSha: head.commit.commit.tree.sha }
+  return toTreeSnapshot(head, branch)
+}
+
+/** `GET /commits/{ref}` 的响应（只声明用到的字段） */
+export interface GitCommitResponse {
+  sha: string
+  commit: {
+    /** 完整的 commit message（可能多行） */
+    message?: string
+    tree: { sha: string }
+  }
+  parents?: { sha: string }[]
+}
+
+/** 从 API 响应里取出 branch / commitSha / treeSha，单独抽出来便于单测 */
+export function toTreeSnapshot(head: GitCommitResponse, branch: string): TreeSnapshot {
+  const commitSha = head?.sha
+  const treeSha = head?.commit?.tree?.sha
+  if (!commitSha || !treeSha) {
+    throw new GitHubError(0, 'GitHub 返回的提交信息缺少 tree 字段，无法判断仓库是否变化')
+  }
+  return { branch, commitSha, treeSha }
 }
 
 /**
  * 顺着提交历史往前找，找到 tree sha 等于 `targetTreeSha` 的那次提交，
  * 也就是缓存建立时的那个时间点。
+ *
+ * 先直接查一次起始 commit：缓存很可能就是「上一次访问」建立的，
+ * 这样最常见的「只多了一两个提交」场景能少一次请求。
  */
 async function findCommitWithTree(
   settings: Settings,
@@ -175,13 +207,12 @@ async function findCommitWithTree(
 ): Promise<string | null> {
   let sha = startCommitSha
   for (let depth = 0; depth < maxDepth; depth++) {
-    const commit = await ghFetch<{
-      sha: string
-      commit: { tree: { sha: string } }
-      parents: { sha: string }[]
-    }>(settings, `${repoPath(settings)}/commits/${sha}`)
+    const commit = await ghFetch<GitCommitResponse>(
+      settings,
+      `${repoPath(settings)}/commits/${sha}`,
+    )
 
-    if (commit.commit.tree.sha === targetTreeSha) return commit.sha
+    if (commit.commit?.tree?.sha === targetTreeSha) return commit.sha
     const parent = commit.parents?.[0]
     if (!parent) return null
     sha = parent.sha
